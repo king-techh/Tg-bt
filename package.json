@@ -1,7 +1,7 @@
 {
   "name": "shieldguard-bot",
-  "version": "1.0.0",
-  "description": "ShieldGuard - Premium Telegram Group Protection Bot",
+  "version": "2.0.0",
+  "description": "ShieldGuard v2 - Premium Telegram Group Protection Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

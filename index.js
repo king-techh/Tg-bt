@@ -1,6 +1,8 @@
 /**
- * ShieldGuard Bot — Premium Telegram Group Protection Bot
- * Node.js / grammY version — Zero errors, Docker-ready
+ * ╔═══════════════════════════════════════════════╗
+ * ║     🛡️  SHIELDGUARD BOT v2.0 — PREMIUM     ║
+ * ║     Telegram Group Protection Engine         ║
+ * ╚═══════════════════════════════════════════════╝
  *
  * Features:
  *   🔗 Anti-Link (Telegram, WhatsApp, all URLs)
@@ -10,91 +12,102 @@
  *   🌊 Anti-Flood (rate limit messages)
  *   🎭 Anti-Sticker/Animation spam
  *   ⚠️ Warn System (3 warns = ban)
- *   🎉 Premium Welcome Messages
- *   🟢 Auto-activate all features when bot becomes admin
+ *   🎉 Premium Welcome Messages (5 templates)
+ *   🟢 Auto-activate when bot becomes admin
  *   ⚙️ /settings to toggle features
  *   📊 /stats for group stats
+ *   🏥 HTTP health server for Render deployment
  */
 
-const { Bot, InlineKeyboard, Router, webhookCallback } = require("grammy");
+const { Bot, InlineKeyboard } = require("grammy");
+const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
-const BOT_TOKEN = process.env.BOT_TOKEN || "88768423638:AAG1YrS0hGOoCjAS9A9XCuMIe3IUYOgOTTo";
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const PORT = process.env.PORT || 3000;
 const MAX_WARNS = 3;
-const FLOOD_LIMIT = 5;       // messages
-const FLOOD_WINDOW = 5000;   // ms
+const FLOOD_LIMIT = 5;
+const FLOOD_WINDOW = 5000;
 const DATA_FILE = path.join(__dirname, "bot_data.json");
+
+if (!BOT_TOKEN) {
+  console.error("❌ FATAL: BOT_TOKEN environment variable is not set!");
+  console.error("   Set it in Render → Environment → BOT_TOKEN = your_token_from_BotFather");
+  console.error("   Starting HTTP server anyway so Render doesn't crash...");
+  startHealthServer();
+  return;
+}
+
+// ─── Admin Cache (speed boost — avoids repeated API calls) ────────────────────
+
+const adminCache = new Map();
+const ADMIN_CACHE_TTL = 30000; // 30 seconds
+
+function cacheKey(chatId, userId) { return `${chatId}:${userId}`; }
+
+function getCachedAdmin(chatId, userId) {
+  const k = cacheKey(chatId, userId);
+  const entry = adminCache.get(k);
+  if (entry && Date.now() - entry.time < ADMIN_CACHE_TTL) return entry.value;
+  adminCache.delete(k);
+  return null;
+}
+
+function setCachedAdmin(chatId, userId, value) {
+  adminCache.set(cacheKey(chatId, userId), { value, time: Date.now() });
+}
 
 // ─── Persistent Data Store ────────────────────────────────────────────────────
 
 function loadData() {
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      return JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-    }
-  } catch (e) {
-    console.error("Failed to load data, starting fresh:", e.message);
-  }
+    if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
+  } catch (e) { console.error("Data load error:", e.message); }
   return { warns: {}, groups: {}, stats: {}, flood: {} };
 }
 
-function saveData(data) {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.error("Failed to save data:", e.message);
-  }
+let store = loadData();
+let saveTimer = null;
+
+function save() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try { fs.writeFileSync(DATA_FILE, JSON.stringify(store)); } catch (e) { console.error("Save error:", e.message); }
+  }, 2000);
 }
 
-let store = loadData();
+// ─── Group Settings ───────────────────────────────────────────────────────────
 
-function save() { saveData(store); }
-
-// ─── Group Settings Defaults ──────────────────────────────────────────────────
-
-function defaultGroupSettings() {
+function defaultGroup() {
   return {
-    anti_link: true,
-    anti_mention: true,
-    anti_photo: true,
-    anti_forward: true,
-    anti_flood: true,
-    anti_sticker: false,
-    welcome_enabled: true,
-    welcome_text: "default",
-    active: false,
+    anti_link: true, anti_mention: true, anti_photo: true,
+    anti_forward: true, anti_flood: true, anti_sticker: false,
+    welcome_enabled: true, welcome_text: "default", active: false,
   };
 }
 
 function getGroup(chatId) {
   const cid = String(chatId);
-  if (!store.groups[cid]) {
-    store.groups[cid] = defaultGroupSettings();
-    save();
-  }
+  if (!store.groups[cid]) { store.groups[cid] = defaultGroup(); save(); }
   return store.groups[cid];
 }
 
 function updateGroup(chatId, key, value) {
-  const group = getGroup(chatId);
-  group[key] = value;
+  getGroup(chatId)[key] = value;
   save();
 }
 
-// ─── Warn Helpers ─────────────────────────────────────────────────────────────
+// ─── Warns ────────────────────────────────────────────────────────────────────
 
 function getWarns(chatId, userId) {
-  const cid = String(chatId);
-  const uid = String(userId);
-  return (store.warns[cid] && store.warns[cid][uid]) || 0;
+  return (store.warns[String(chatId)] && store.warns[String(chatId)][String(userId)]) || 0;
 }
 
 function addWarn(chatId, userId) {
-  const cid = String(chatId);
-  const uid = String(userId);
+  const cid = String(chatId), uid = String(userId);
   if (!store.warns[cid]) store.warns[cid] = {};
   store.warns[cid][uid] = (store.warns[cid][uid] || 0) + 1;
   save();
@@ -102,49 +115,33 @@ function addWarn(chatId, userId) {
 }
 
 function resetWarns(chatId, userId) {
-  const cid = String(chatId);
-  const uid = String(userId);
-  if (store.warns[cid] && store.warns[cid][uid] !== undefined) {
-    store.warns[cid][uid] = 0;
-    save();
-  }
+  const cid = String(chatId), uid = String(userId);
+  if (store.warns[cid]) { store.warns[cid][uid] = 0; save(); }
 }
 
-// ─── Stats Helpers ────────────────────────────────────────────────────────────
+// ─── Stats ────────────────────────────────────────────────────────────────────
 
 function bumpStat(chatId, key) {
   const cid = String(chatId);
-  if (!store.stats[cid]) {
-    store.stats[cid] = { deletes: 0, warns: 0, bans: 0, welcomes: 0 };
-  }
+  if (!store.stats[cid]) store.stats[cid] = { deletes: 0, warns: 0, bans: 0, welcomes: 0 };
   store.stats[cid][key] = (store.stats[cid][key] || 0) + 1;
   save();
 }
 
-// ─── Flood Helpers ────────────────────────────────────────────────────────────
+// ─── Flood ────────────────────────────────────────────────────────────────────
 
 function checkFlood(chatId, userId) {
-  const cid = String(chatId);
-  const uid = String(userId);
-  const now = Date.now();
+  const cid = String(chatId), uid = String(userId), now = Date.now();
   if (!store.flood[cid]) store.flood[cid] = {};
   if (!store.flood[cid][uid]) store.flood[cid][uid] = [];
-
-  // Remove old timestamps
-  store.flood[cid][uid] = store.flood[cid][uid].filter((t) => now - t < FLOOD_WINDOW);
+  store.flood[cid][uid] = store.flood[cid][uid].filter(t => now - t < FLOOD_WINDOW);
   store.flood[cid][uid].push(now);
-
-  // Only save periodically to reduce I/O
-  if (store.flood[cid][uid].length > FLOOD_LIMIT) {
-    save();
-    return true;
-  }
-  return false;
+  return store.flood[cid][uid].length > FLOOD_LIMIT;
 }
 
-// ─── Link & Mention Detection ─────────────────────────────────────────────────
+// ─── Detection ────────────────────────────────────────────────────────────────
 
-const LINK_REGEXES = [
+const LINK_TESTS = [
   /https?:\/\//i,
   /t\.me\//i,
   /telegram\.(me|dog)\//i,
@@ -153,498 +150,364 @@ const LINK_REGEXES = [
   /chat\.whatsapp\.com/i,
 ];
 
-const MENTION_REGEX = /@[\w]{5,32}/i;
+const MENTION_RE = /@[\w]{5,32}/;
 
-function containsLink(text) {
-  if (!text) return false;
-  return LINK_REGEXES.some((r) => r.test(text));
-}
+function hasLink(t) { return t ? LINK_TESTS.some(r => r.test(t)) : false; }
+function hasMention(t) { return t ? MENTION_RE.test(t) : false; }
 
-function containsMention(text) {
-  if (!text) return false;
-  return MENTION_REGEX.test(text);
-}
+// ─── Bot + Admin Check ────────────────────────────────────────────────────────
 
-// ─── Admin Check ──────────────────────────────────────────────────────────────
+const bot = new Bot(BOT_TOKEN);
 
 async function isAdmin(chatId, userId) {
+  const cached = getCachedAdmin(chatId, userId);
+  if (cached !== null) return cached;
   try {
-    const member = await bot.api.getChatMember(chatId, userId);
-    return member.status === "administrator" || member.status === "creator";
-  } catch (e) {
-    console.error("Admin check failed:", e.message);
-    return false;
-  }
+    const m = await bot.api.getChatMember(chatId, userId);
+    const result = m.status === "administrator" || m.status === "creator";
+    setCachedAdmin(chatId, userId, result);
+    return result;
+  } catch (e) { return false; }
 }
 
-// ─── Warn User (delete + warn + maybe ban) ────────────────────────────────────
+// ─── MarkdownV2 Escape ────────────────────────────────────────────────────────
+
+function esc(t) {
+  return t ? t.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1") : "";
+}
+
+// ─── Warn + Ban ───────────────────────────────────────────────────────────────
 
 async function warnUser(chatId, user, reason) {
-  const warnCount = addWarn(chatId, user.id);
+  const n = addWarn(chatId, user.id);
   bumpStat(chatId, "warns");
-  const remaining = MAX_WARNS - warnCount;
+  const left = MAX_WARNS - n;
 
-  if (warnCount >= MAX_WARNS) {
+  if (n >= MAX_WARNS) {
     try {
       await bot.api.banChatMember(chatId, user.id);
       bumpStat(chatId, "bans");
       resetWarns(chatId, user.id);
-      await bot.api.sendMessage(
-        chatId,
-        `🚫 *${escapeMD(user.first_name)}* has been *BANNED* after ${MAX_WARNS} warnings!\n📌 Reason: ${reason}`,
+      await bot.api.sendMessage(chatId,
+        `🚫 ═══════════════════════════\n` +
+        `*BAN HAMMER STRUCK*\n` +
+        `═══════════════════════════\n\n` +
+        `👤 User: ${esc(user.first_name)}\n` +
+        `💀 Reached ${MAX_WARNS}/${MAX_WARNS} warnings\n` +
+        `📌 Last reason: ${esc(reason)}\n\n` +
+        `_They have been removed from the group._`,
         { parse_mode: "MarkdownV2" }
       );
       return true;
     } catch (e) {
       console.error("Ban failed:", e.message);
-      await bot.api.sendMessage(
-        chatId,
-        `⚠️ Failed to ban user. I may not have permission.\nUser has ${warnCount}/${MAX_WARNS} warns.`
-      );
+      await bot.api.sendMessage(chatId, `⚠️ Ban failed — check my permissions. User at ${n}/${MAX_WARNS} warns.`);
       return false;
     }
   } else {
-    const plural = remaining !== 1 ? "s" : "";
-    await bot.api.sendMessage(
-      chatId,
-      `⚠️ *Warning ${warnCount}/${MAX_WARNS}* for ${escapeMD(user.first_name)}\n📌 Reason: ${reason}\n💀 ${remaining} more warning${plural} until ban!`,
+    const warnBar = "🔴".repeat(n) + "⚪".repeat(left);
+    await bot.api.sendMessage(chatId,
+      `⚠️ ═══════════════════════════\n` +
+      `*WARNING ${n}/${MAX_WARNS}*\n` +
+      `═══════════════════════════\n\n` +
+      `👤 User: ${esc(user.first_name)}\n` +
+      `📌 Reason: ${esc(reason)}\n` +
+      `📊 Strikes: ${warnBar}\n\n` +
+      `_💀 ${left} more strike${left !== 1 ? "s" : ""} = BAN_`,
       { parse_mode: "MarkdownV2" }
     );
     return false;
   }
 }
 
-// ─── MarkdownV2 Escape ────────────────────────────────────────────────────────
-
-function escapeMD(text) {
-  if (!text) return "";
-  return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
-}
-
 // ─── Premium Welcome Templates ────────────────────────────────────────────────
 
-const WELCOME_TEMPLATES = {
-  default: (user, group) =>
+const WELCOMES = {
+  default: (u, g) =>
     `╔════════════════════════════╗\n` +
-    `║   🛡️ *SHIELD GUARD PRO*   ║\n` +
+    `║   🛡️ *SHIELD GUARD PRO*    ║\n` +
     `╚════════════════════════════╝\n\n` +
-    `🌟 Welcome ${user} to *${group}*!\n\n` +
-    `✨ You've entered a premium protected group.\n` +
-    `🔒 Anti\\-Link • Anti\\-Spam • 24/7 Protection\n\n` +
+    `🌟 Welcome ${u} to *${g}*\\!\n\n` +
+    `✨ You have entered a premium protected group\\.\n` +
+    `🔒 Anti\\-Link \\• Anti\\-Spam \\• 24/7 Shield\n\n` +
     `📝 *Rules:*\n` +
     `┃ ❌ No links allowed\n` +
-    `┃ ❌ No @mentions of other users\n` +
+    `┃ ❌ No @mentions\n` +
     `┃ ❌ No forwarded messages\n` +
     `┃ ❌ No unauthorized photos\n` +
-    `┃ ⚠️ 3 warnings = instant ban\n\n` +
-    `Enjoy your stay! 🎉`,
+    `┃ ⚠️ 3 strikes \\= instant ban\n\n` +
+    `Enjoy your stay\\! 🎉`,
 
-  elite: (user, group) =>
+  elite: (u, g) =>
     `⚡ *\\[ ELITE ACCESS GRANTED \\]* ⚡\n\n` +
-    `Welcome ${user} to *${group}*\n\n` +
-    `🔥 This is an elite\\-protected zone.\n` +
-    `🛡️ ShieldGuard Pro is actively monitoring.\n\n` +
+    `Welcome ${u} to *${g}*\n\n` +
+    `🔥 This is an elite\\-protected zone\\.\n` +
+    `🛡️ ShieldGuard Pro is actively monitoring\\.\n\n` +
     `⚡ *Protected by:*\n` +
     `┣ 🔗 Anti\\-Link Shield\n` +
     `┣ 📸 Anti\\-Photo Guard\n` +
     `┣ 🚫 Anti\\-Mention Wall\n` +
     `┣ 🌊 Anti\\-Flood Barrier\n` +
-    `┗ ⚠️ Strike System \\(3 = Ban\\)\n\n` +
-    `Welcome aboard! 🚀`,
+    `┗ ⚠️ Strike System \\(3 \\= Ban\\)\n\n` +
+    `Welcome aboard\\! 🚀`,
 
-  minimal: (user, group) =>
-    `👋 Welcome ${user} to *${group}*!\n` +
-    `🛡️ Protected by ShieldGuard Pro\n` +
-    `⚠️ 3 warnings = ban. No links or spam.`,
+  minimal: (u, g) =>
+    `👋 Welcome ${u} to *${g}*\\!\n🛡️ Protected by ShieldGuard Pro\n⚠️ 3 strikes \\= ban\\. No links or spam\\.`,
 
-  gaming: (user, group) =>
+  gaming: (u, g) =>
     `🎮 *PLAYER JOINED THE LOBBY* 🎮\n\n` +
-    `👤 ${user} has entered *${group}*\n\n` +
+    `👤 ${u} entered *${g}*\n\n` +
     `🛡️ *Active Buffs:*\n` +
-    `┣ 🔗 Link Shield \\[LVL MAX\\]\n` +
-    `┣ 📸 Photo Block \\[LVL MAX\\]\n` +
-    `┣ 🚫 Mention Wall \\[LVL MAX\\]\n` +
-    `┣ 🌊 Flood Guard \\[LVL MAX\\]\n` +
+    `┣ 🔗 Link Shield \\[MAX\\]\n` +
+    `┣ 📸 Photo Block \\[MAX\\]\n` +
+    `┣ 🚫 Mention Wall \\[MAX\\]\n` +
+    `┣ 🌊 Flood Guard \\[MAX\\]\n` +
     `┗ ⚠️ Ban Hammer \\[3 STRIKES\\]\n\n` +
-    `Good luck, have fun! 🎲`,
+    `GLHF\\! 🎲`,
+
+  neon: (u, g) =>
+    `💎 *\\~\\~ NEON ZONE ACTIVATED \\~\\~* 💎\n\n` +
+    `${u} \\→ *${g}*\n\n` +
+    `🟣 ShieldGuard Pro \\| Online\n` +
+    `━━━━━━━━━━━━━━━━━━━━━\n` +
+    `🔗 Link Shield   ████ 100%\n` +
+    `📸 Photo Guard   ████ 100%\n` +
+    `🚫 Mention Wall  ████ 100%\n` +
+    `🌊 Flood Barrier ████ 100%\n` +
+    `⚠️ Ban Protocol  ████ READY\n` +
+    `━━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `Welcome to the grid\\. 💠`,
 };
 
-function getWelcomeText(templateName, userName, groupName) {
-  const tpl = WELCOME_TEMPLATES[templateName] || WELCOME_TEMPLATES.default;
-  return tpl(userName, groupName);
+function welcomeText(name, group, tpl) {
+  return (WELCOMES[tpl] || WELCOMES.default)(name, group);
 }
 
-// ─── Bot Setup ────────────────────────────────────────────────────────────────
-
-const bot = new Bot(BOT_TOKEN);
-
-// ─── /start Command ──────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// COMMANDS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 bot.command("start", async (ctx) => {
   if (ctx.chat.type === "private") {
     await ctx.reply(
-      "🛡️ *ShieldGuard Bot — Premium Group Protection*\n\n" +
-      "Add me to your group and make me admin to activate all protection features automatically!\n\n" +
-      "🔹 Anti-Link (Telegram, WhatsApp, URLs)\n" +
-      "🔹 Anti-@Mention\n" +
-      "🔹 Anti-Photo\n" +
-      "🔹 Anti-Forward\n" +
-      "🔹 Anti-Flood\n" +
-      "🔹 Warn System (3 = Ban)\n" +
+      "🛡️ *ShieldGuard Bot v2\\.0 — Premium Protection*\n\n" +
+      "Add me to a group and make me admin \\— all protections activate instantly\\!\n\n" +
+      "🔹 Anti\\-Link \\(Telegram, WhatsApp, URLs\\)\n" +
+      "🔹 Anti\\-@Mention\n" +
+      "🔹 Anti\\-Photo\n" +
+      "🔹 Anti\\-Forward\n" +
+      "🔹 Anti\\-Flood\n" +
+      "🔹 Warn System \\(3 \\= Ban\\)\n" +
       "🔹 Premium Welcome Messages\n\n" +
-      "Use /help to see all commands.",
-      { parse_mode: "Markdown" }
+      "Use /help to see all commands\\.",
+      { parse_mode: "MarkdownV2" }
     );
   } else {
-    await ctx.reply("🛡️ ShieldGuard is active! Use /help to see commands.");
+    await ctx.reply(
+      "🛡️ *ShieldGuard is active\\!* Use /help for commands\\.",
+      { parse_mode: "MarkdownV2" }
+    );
   }
 });
-
-// ─── /help Command ────────────────────────────────────────────────────────────
 
 bot.command("help", async (ctx) => {
   await ctx.reply(
-    "🛡️ *ShieldGuard Bot — Command List*\n\n" +
+    "🛡️ *ShieldGuard v2\\.0 — Command List*\n\n" +
     "📌 *User Commands:*\n" +
-    "┣ /start — Start the bot\n" +
-    "┣ /help — Show this message\n" +
-    "┣ /warnings — Check your warnings\n" +
-    "┗ /stats — Group protection stats\n\n" +
+    "┣ /start \\— Start the bot\n" +
+    "┣ /help \\— Show this message\n" +
+    "┣ /warnings \\— Check your warnings\n" +
+    "┗ /stats \\— Group protection stats\n\n" +
     "👑 *Admin Commands:*\n" +
-    "┣ /settings — Toggle protection features\n" +
-    "┣ /resetwarns — Reset a user's warnings\n" +
-    "┣ /warn — Manually warn a user\n" +
-    "┣ /unwarn — Remove one warning\n" +
-    "┗ /ban — Ban a user\n\n" +
-    "⚙️ *Auto-Active Features (when bot is admin):*\n" +
-    "┣ 🔗 Anti-Link\n" +
-    "┣ 📸 Anti-Photo\n" +
-    "┣ 🚫 Anti-@Mention\n" +
-    "┣ ↔️ Anti-Forward\n" +
-    "┣ 🌊 Anti-Flood\n" +
-    "┗ 🎉 Welcome Messages",
-    { parse_mode: "Markdown" }
-  );
-});
-
-// ─── /warnings Command ────────────────────────────────────────────────────────
-
-bot.command("warnings", async (ctx) => {
-  if (ctx.chat.type === "private") {
-    await ctx.reply("🚫 This command only works in groups.");
-    return;
-  }
-
-  const target = ctx.msg.reply_to_message ? ctx.msg.reply_to_message.from : ctx.from;
-  const warnCount = getWarns(ctx.chat.id, target.id);
-  const remaining = MAX_WARNS - warnCount;
-
-  await ctx.reply(
-    `⚠️ *Warnings for ${escapeMD(target.first_name)}:*\n` +
-    `📌 ${warnCount}/${MAX_WARNS} warnings\n` +
-    `💀 ${remaining} remaining before ban`,
+    "┣ /settings \\— Toggle protection features\n" +
+    "┣ /warn \\— Manually warn a user \\(reply\\)\n" +
+    "┣ /unwarn \\— Remove one warning \\(reply\\)\n" +
+    "┣ /resetwarns \\— Reset warnings \\(reply\\)\n" +
+    "┗ /ban \\— Ban a user \\(reply\\)\n\n" +
+    "⚙️ *Auto\\-Active Features:*\n" +
+    "┣ 🔗 Anti\\-Link\n┣ 📸 Anti\\-Photo\n┣ 🚫 Anti\\-@Mention\n" +
+    "┣ ↔️ Anti\\-Forward\n┣ 🌊 Anti\\-Flood\n┗ 🎉 Welcome Messages",
     { parse_mode: "MarkdownV2" }
   );
 });
 
-// ─── /resetwarns Command (Admin) ──────────────────────────────────────────────
+bot.command("warnings", async (ctx) => {
+  if (ctx.chat.type === "private") { await ctx.reply("🚫 Groups only."); return; }
+  const t = ctx.msg.reply_to_message ? ctx.msg.reply_to_message.from : ctx.from;
+  const n = getWarns(ctx.chat.id, t.id);
+  const left = MAX_WARNS - n;
+  const bar = "🔴".repeat(n) + "⚪".repeat(left);
+  await ctx.reply(
+    `⚠️ *Warnings for ${esc(t.first_name)}:*\n📊 ${bar}\n📌 ${n}/${MAX_WARNS} \\— ${left} remaining`,
+    { parse_mode: "MarkdownV2" }
+  );
+});
 
 bot.command("resetwarns", async (ctx) => {
   if (ctx.chat.type === "private") return;
-  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) {
-    await ctx.reply("🚫 *Admin only command.*", { parse_mode: "Markdown" });
-    return;
-  }
-  if (!ctx.msg.reply_to_message) {
-    await ctx.reply("⚠️ Reply to a user's message to reset their warnings.");
-    return;
-  }
-
-  const target = ctx.msg.reply_to_message.from;
-  resetWarns(ctx.chat.id, target.id);
-  await ctx.reply(`✅ Warnings reset for ${escapeMD(target.first_name)}`, {
-    parse_mode: "MarkdownV2",
-  });
+  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) { await ctx.reply("🚫 Admin only."); return; }
+  if (!ctx.msg.reply_to_message) { await ctx.reply("⚠️ Reply to a user's message."); return; }
+  resetWarns(ctx.chat.id, ctx.msg.reply_to_message.from.id);
+  await ctx.reply(`✅ Warnings reset for ${esc(ctx.msg.reply_to_message.from.first_name)}`, { parse_mode: "MarkdownV2" });
 });
-
-// ─── /warn Command (Admin) ────────────────────────────────────────────────────
 
 bot.command("warn", async (ctx) => {
   if (ctx.chat.type === "private") return;
-  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) {
-    await ctx.reply("🚫 *Admin only command.*", { parse_mode: "Markdown" });
-    return;
-  }
-  if (!ctx.msg.reply_to_message) {
-    await ctx.reply("⚠️ Reply to a user's message to warn them.");
-    return;
-  }
-
-  const target = ctx.msg.reply_to_message.from;
+  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) { await ctx.reply("🚫 Admin only."); return; }
+  if (!ctx.msg.reply_to_message) { await ctx.reply("⚠️ Reply to a user's message."); return; }
+  const t = ctx.msg.reply_to_message.from;
   const reason = ctx.match || "Manual admin warning";
-  const warnCount = addWarn(ctx.chat.id, target.id);
+  const n = addWarn(ctx.chat.id, t.id);
   bumpStat(ctx.chat.id, "warns");
-  const remaining = MAX_WARNS - warnCount;
-
-  if (warnCount >= MAX_WARNS) {
+  const left = MAX_WARNS - n;
+  if (n >= MAX_WARNS) {
     try {
-      await bot.api.banChatMember(ctx.chat.id, target.id);
-      bumpStat(ctx.chat.id, "bans");
-      resetWarns(ctx.chat.id, target.id);
-      await ctx.reply(
-        `🚫 *${escapeMD(target.first_name)}* has been *BANNED* after ${MAX_WARNS} warnings!`,
-        { parse_mode: "MarkdownV2" }
-      );
-    } catch (e) {
-      await ctx.reply(`⚠️ Failed to ban: ${e.message}`);
-    }
+      await bot.api.banChatMember(ctx.chat.id, t.id);
+      bumpStat(ctx.chat.id, "bans"); resetWarns(ctx.chat.id, t.id);
+      await ctx.reply(`🚫 *${esc(t.first_name)}* BANNED \\— ${MAX_WARNS} strikes reached\\!`, { parse_mode: "MarkdownV2" });
+    } catch (e) { await ctx.reply(`⚠️ Ban failed: ${e.message}`); }
   } else {
-    const plural = remaining !== 1 ? "s" : "";
+    const bar = "🔴".repeat(n) + "⚪".repeat(left);
     await ctx.reply(
-      `⚠️ *Warning ${warnCount}/${MAX_WARNS}* for ${escapeMD(target.first_name)}\n` +
-      `📌 Reason: ${reason}\n` +
-      `💀 ${remaining} more warning${plural} until ban`,
+      `⚠️ *Warning ${n}/${MAX_WARNS}* for ${esc(t.first_name)}\n📊 ${bar}\n📌 ${esc(reason)}\n💀 ${left} strike${left !== 1 ? "s" : ""} left`,
       { parse_mode: "MarkdownV2" }
     );
   }
 });
-
-// ─── /unwarn Command (Admin) ──────────────────────────────────────────────────
 
 bot.command("unwarn", async (ctx) => {
   if (ctx.chat.type === "private") return;
-  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) {
-    await ctx.reply("🚫 *Admin only command.*", { parse_mode: "Markdown" });
-    return;
-  }
-  if (!ctx.msg.reply_to_message) {
-    await ctx.reply("⚠️ Reply to a user's message to remove a warning.");
-    return;
-  }
-
-  const target = ctx.msg.reply_to_message.from;
-  const current = getWarns(ctx.chat.id, target.id);
-
-  if (current <= 0) {
-    await ctx.reply("✅ This user has no warnings.");
-    return;
-  }
-
-  const cid = String(ctx.chat.id);
-  const uid = String(target.id);
+  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) { await ctx.reply("🚫 Admin only."); return; }
+  if (!ctx.msg.reply_to_message) { await ctx.reply("⚠️ Reply to a user's message."); return; }
+  const t = ctx.msg.reply_to_message.from;
+  const cur = getWarns(ctx.chat.id, t.id);
+  if (cur <= 0) { await ctx.reply("✅ No warnings."); return; }
+  const cid = String(ctx.chat.id), uid = String(t.id);
   if (!store.warns[cid]) store.warns[cid] = {};
-  store.warns[cid][uid] = current - 1;
-  save();
-
-  await ctx.reply(
-    `✅ Removed 1 warning from ${escapeMD(target.first_name)}\n📌 Now at ${current - 1}/${MAX_WARNS}`,
-    { parse_mode: "MarkdownV2" }
-  );
+  store.warns[cid][uid] = cur - 1; save();
+  await ctx.reply(`✅ Removed 1 warning from ${esc(t.first_name)} \\→ ${cur - 1}/${MAX_WARNS}`, { parse_mode: "MarkdownV2" });
 });
-
-// ─── /ban Command (Admin) ─────────────────────────────────────────────────────
 
 bot.command("ban", async (ctx) => {
   if (ctx.chat.type === "private") return;
-  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) {
-    await ctx.reply("🚫 *Admin only command.*", { parse_mode: "Markdown" });
-    return;
-  }
-  if (!ctx.msg.reply_to_message) {
-    await ctx.reply("⚠️ Reply to a user's message to ban them.");
-    return;
-  }
-
-  const target = ctx.msg.reply_to_message.from;
+  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) { await ctx.reply("🚫 Admin only."); return; }
+  if (!ctx.msg.reply_to_message) { await ctx.reply("⚠️ Reply to a user's message."); return; }
+  const t = ctx.msg.reply_to_message.from;
   const reason = ctx.match || "Admin ban";
-
   try {
-    await bot.api.banChatMember(ctx.chat.id, target.id);
-    bumpStat(ctx.chat.id, "bans");
-    resetWarns(ctx.chat.id, target.id);
-    await ctx.reply(
-      `🔨 *${escapeMD(target.first_name)}* has been *BANNED*\n📌 Reason: ${reason}`,
-      { parse_mode: "MarkdownV2" }
-    );
-  } catch (e) {
-    await ctx.reply(`⚠️ Failed to ban: ${e.message}`);
-  }
+    await bot.api.banChatMember(ctx.chat.id, t.id);
+    bumpStat(ctx.chat.id, "bans"); resetWarns(ctx.chat.id, t.id);
+    await ctx.reply(`🔨 *${esc(t.first_name)}* has been *BANNED*\n📌 ${esc(reason)}`, { parse_mode: "MarkdownV2" });
+  } catch (e) { await ctx.reply(`⚠️ Ban failed: ${e.message}`); }
 });
-
-// ─── /stats Command ───────────────────────────────────────────────────────────
 
 bot.command("stats", async (ctx) => {
   if (ctx.chat.type === "private") return;
-
-  const cid = String(ctx.chat.id);
-  const stats = store.stats[cid] || { deletes: 0, warns: 0, bans: 0, welcomes: 0 };
-  const group = getGroup(ctx.chat.id);
-  const activeStatus = group.active ? "🟢 ACTIVE" : "🔴 INACTIVE";
-
+  const s = store.stats[String(ctx.chat.id)] || { deletes: 0, warns: 0, bans: 0, welcomes: 0 };
+  const g = getGroup(ctx.chat.id);
+  const st = g.active ? "🟢 ACTIVE" : "🔴 INACTIVE";
   await ctx.reply(
-    `📊 *ShieldGuard Stats — ${escapeMD(ctx.chat.title)}*\n\n` +
-    `🛡️ Status: ${activeStatus}\n` +
-    `🗑️ Messages Deleted: ${stats.deletes}\n` +
-    `⚠️ Warnings Issued: ${stats.warns}\n` +
-    `🔨 Users Banned: ${stats.bans}\n` +
-    `👋 Welcomes Sent: ${stats.welcomes}\n\n` +
-    `⚙️ *Active Protections:*\n` +
-    `┣ 🔗 Anti-Link: ${group.anti_link ? "✅" : "❌"}\n` +
-    `┣ 🚫 Anti-@Mention: ${group.anti_mention ? "✅" : "❌"}\n` +
-    `┣ 📸 Anti-Photo: ${group.anti_photo ? "✅" : "❌"}\n` +
-    `┣ ↔️ Anti-Forward: ${group.anti_forward ? "✅" : "❌"}\n` +
-    `┣ 🌊 Anti-Flood: ${group.anti_flood ? "✅" : "❌"}\n` +
-    `┗ 🎭 Anti-Sticker: ${group.anti_sticker ? "✅" : "❌"}`,
+    `📊 *ShieldGuard Stats — ${esc(ctx.chat.title)}*\n\n` +
+    `🛡️ Status: ${st}\n` +
+    `🗑️ Deleted: ${s.deletes} \\| ⚠️ Warns: ${s.warns}\n` +
+    `🔨 Banned: ${s.bans} \\| 👋 Welcomes: ${s.welcomes}\n\n` +
+    `⚙️ *Protections:*\n` +
+    `┣ 🔗 Anti\\-Link: ${g.anti_link ? "✅" : "❌"}\n` +
+    `┣ 🚫 Anti\\-@Mention: ${g.anti_mention ? "✅" : "❌"}\n` +
+    `┣ 📸 Anti\\-Photo: ${g.anti_photo ? "✅" : "❌"}\n` +
+    `┣ ↔️ Anti\\-Forward: ${g.anti_forward ? "✅" : "❌"}\n` +
+    `┣ 🌊 Anti\\-Flood: ${g.anti_flood ? "✅" : "❌"}\n` +
+    `┗ 🎭 Anti\\-Sticker: ${g.anti_sticker ? "✅" : "❌"}`,
     { parse_mode: "MarkdownV2" }
   );
 });
 
-// ─── /settings Command (Admin) ────────────────────────────────────────────────
+// ─── Settings ─────────────────────────────────────────────────────────────────
 
 bot.command("settings", async (ctx) => {
   if (ctx.chat.type === "private") return;
-  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) {
-    await ctx.reply("🚫 *Admin only command.*", { parse_mode: "Markdown" });
-    return;
-  }
-
-  await sendSettingsMenu(ctx);
+  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) { await ctx.reply("🚫 Admin only."); return; }
+  await settingsMenu(ctx);
 });
 
-async function sendSettingsMenu(ctx) {
-  const group = getGroup(ctx.chat.id);
-  const features = [
-    ["anti_link", "🔗 Anti-Link"],
-    ["anti_mention", "🚫 Anti-@Mention"],
-    ["anti_photo", "📸 Anti-Photo"],
-    ["anti_forward", "↔️ Anti-Forward"],
-    ["anti_flood", "🌊 Anti-Flood"],
-    ["anti_sticker", "🎭 Anti-Sticker"],
+async function settingsMenu(ctx) {
+  const g = getGroup(ctx.chat.id);
+  const feats = [
+    ["anti_link", "🔗 Anti-Link"], ["anti_mention", "🚫 Anti-@Mention"],
+    ["anti_photo", "📸 Anti-Photo"], ["anti_forward", "↔️ Anti-Forward"],
+    ["anti_flood", "🌊 Anti-Flood"], ["anti_sticker", "🎭 Anti-Sticker"],
     ["welcome_enabled", "🎉 Welcome"],
   ];
+  const kb = new InlineKeyboard();
+  for (const [k, l] of feats) kb.text(`${g[k] ? "✅" : "❌"} ${l}`, `t_${k}`).row();
+  kb.text("📝 Welcome Template", "wmenu");
 
-  const keyboard = new InlineKeyboard();
-  for (const [key, label] of features) {
-    const status = group[key] ? "✅" : "❌";
-    keyboard.text(`${status} ${label}`, `toggle_${key}`).row();
-  }
-  keyboard.text("📝 Set Welcome Template", "welcome_menu");
-
-  const activeStatus = group.active ? "🟢 ACTIVE" : "🔴 INACTIVE (need admin)";
-
+  const st = g.active ? "🟢 ACTIVE" : "🔴 INACTIVE";
+  const text = `🛡️ *ShieldGuard Settings*\nStatus: ${st}\n\nToggle features:`;
   if (ctx.callbackQuery) {
-    await ctx.callbackQuery.editMessageText(
-      `🛡️ *ShieldGuard Settings*\nStatus: ${activeStatus}\n\nToggle features below:`,
-      { parse_mode: "Markdown", reply_markup: keyboard }
-    );
+    await ctx.callbackQuery.editMessageText(text, { parse_mode: "Markdown", reply_markup: kb });
   } else {
-    await ctx.reply(
-      `🛡️ *ShieldGuard Settings*\nStatus: ${activeStatus}\n\nToggle features below:`,
-      { parse_mode: "Markdown", reply_markup: keyboard }
-    );
+    await ctx.reply(text, { parse_mode: "Markdown", reply_markup: kb });
   }
 }
 
-// ─── Callback Query Handler (Settings Toggles) ───────────────────────────────
-
-bot.callbackQuery(/^toggle_/, async (ctx) => {
-  const chatId = ctx.chat.id;
-  const userId = ctx.from.id;
-
-  if (!(await isAdmin(chatId, userId))) {
-    await ctx.answerCallbackQuery({ text: "🚫 Admin only!", show_alert: true });
-    return;
-  }
-
-  const key = ctx.callbackQuery.data.replace("toggle_", "");
-  const group = getGroup(chatId);
-  updateGroup(chatId, key, !group[key]);
-
-  await ctx.answerCallbackQuery({ text: `✅ ${key} toggled!` });
-  await sendSettingsMenu(ctx);
+bot.callbackQuery(/^t_/, async (ctx) => {
+  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) { await ctx.answerCallbackQuery({ text: "🚫 Admin only!", show_alert: true }); return; }
+  const k = ctx.callbackQuery.data.slice(2);
+  const g = getGroup(ctx.chat.id);
+  updateGroup(ctx.chat.id, k, !g[k]);
+  await ctx.answerCallbackQuery({ text: `✅ ${k} ${!g[k] ? "ON" : "OFF"}` });
+  await settingsMenu(ctx);
 });
 
-bot.callbackQuery("welcome_menu", async (ctx) => {
-  const chatId = ctx.chat.id;
-  const userId = ctx.from.id;
-
-  if (!(await isAdmin(chatId, userId))) {
-    await ctx.answerCallbackQuery({ text: "🚫 Admin only!", show_alert: true });
-    return;
-  }
-
-  const keyboard = new InlineKeyboard()
-    .text("🌟 Default (Premium)", "welcome_default").row()
-    .text("⚡ Elite", "welcome_elite").row()
-    .text("📌 Minimal", "welcome_minimal").row()
-    .text("🎮 Gaming", "welcome_gaming").row()
-    .text("🔙 Back", "back_settings");
-
-  await ctx.callbackQuery.editMessageText("📝 *Select a welcome message template:*", {
-    parse_mode: "Markdown",
-    reply_markup: keyboard,
-  });
+bot.callbackQuery("wmenu", async (ctx) => {
+  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) { await ctx.answerCallbackQuery({ text: "🚫 Admin only!", show_alert: true }); return; }
+  const kb = new InlineKeyboard()
+    .text("🌟 Default", "w_default").row()
+    .text("⚡ Elite", "w_elite").row()
+    .text("📌 Minimal", "w_minimal").row()
+    .text("🎮 Gaming", "w_gaming").row()
+    .text("💎 Neon", "w_neon").row()
+    .text("🔙 Back", "wback");
+  await ctx.callbackQuery.editMessageText("📝 *Pick a welcome template:*", { parse_mode: "Markdown", reply_markup: kb });
 });
 
-bot.callbackQuery(/^welcome_/, async (ctx) => {
-  const chatId = ctx.chat.id;
-  const userId = ctx.from.id;
-
-  if (!(await isAdmin(chatId, userId))) {
-    await ctx.answerCallbackQuery({ text: "🚫 Admin only!", show_alert: true });
-    return;
-  }
-
-  const template = ctx.callbackQuery.data.replace("welcome_", "");
-  updateGroup(chatId, "welcome_text", template);
-
-  await ctx.answerCallbackQuery({ text: `✅ Welcome template set to ${template}!` });
-  await ctx.callbackQuery.editMessageText(
-    `✅ Welcome template set to *${template}*!\n\nNew members will see the new welcome message.`,
-    { parse_mode: "Markdown" }
-  );
+bot.callbackQuery(/^w_(?!back|menu)/, async (ctx) => {
+  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) { await ctx.answerCallbackQuery({ text: "🚫 Admin only!", show_alert: true }); return; }
+  const tpl = ctx.callbackQuery.data.slice(2);
+  updateGroup(ctx.chat.id, "welcome_text", tpl);
+  await ctx.answerCallbackQuery({ text: `✅ Template: ${tpl}` });
+  await ctx.callbackQuery.editMessageText(`✅ Welcome template set to *${tpl}*\\!`, { parse_mode: "MarkdownV2" });
 });
 
-bot.callbackQuery("back_settings", async (ctx) => {
-  const chatId = ctx.chat.id;
-  const userId = ctx.from.id;
-
-  if (!(await isAdmin(chatId, userId))) {
-    await ctx.answerCallbackQuery({ text: "🚫 Admin only!", show_alert: true });
-    return;
-  }
-
-  await sendSettingsMenu(ctx);
+bot.callbackQuery("wback", async (ctx) => {
+  if (!(await isAdmin(ctx.chat.id, ctx.from.id))) { await ctx.answerCallbackQuery({ text: "🚫 Admin only!", show_alert: true }); return; }
+  await settingsMenu(ctx);
 });
 
 // ─── Auto-Activate When Bot Becomes Admin ─────────────────────────────────────
 
+let botId = null;
+
 bot.on("my_chat_member", async (ctx) => {
-  const update = ctx.myChatMember;
-  if (!update) return;
+  const u = ctx.myChatMember;
+  if (!u) return;
+  if (!botId) botId = (await bot.api.getMe()).id;
+  if (u.new_chat_member.user.id !== botId) return;
 
-  const botInfo = await bot.api.getMe();
-  if (update.new_chat_member.user.id !== botInfo.id) return;
-
-  const chatId = update.chat.id;
-  const newStatus = update.new_chat_member.status;
-
-  if (newStatus === "administrator" || newStatus === "creator") {
+  const chatId = u.chat.id;
+  if (u.new_chat_member.status === "administrator" || u.new_chat_member.status === "creator") {
     updateGroup(chatId, "active", true);
     try {
-      await bot.api.sendMessage(
-        chatId,
-        "🛡️ *ShieldGuard Pro Activated!*\n\n" +
-        "✅ All protection features are now *ACTIVE*.\n\n" +
-        "🔗 Anti-Link • 📸 Anti-Photo • 🚫 Anti-Mention\n" +
-        "↔️ Anti-Forward • 🌊 Anti-Flood • ⚠️ Warn System\n\n" +
-        "Use /settings to customize features.\n" +
-        "Use /help to see all commands.",
-        { parse_mode: "Markdown" }
+      await bot.api.sendMessage(chatId,
+        "🛡️ *ShieldGuard Pro Activated\\!* \\⚡\n\n" +
+        "✅ All protections are now *ONLINE*\\.\n\n" +
+        "🔗 Anti\\-Link \\• 📸 Anti\\-Photo \\• 🚫 Anti\\-Mention\n" +
+        "↔️ Anti\\-Forward \\• 🌊 Anti\\-Flood \\• ⚠️ Warn System\n\n" +
+        "Use /settings to customize\\.\nUse /help for commands\\.",
+        { parse_mode: "MarkdownV2" }
       );
-    } catch (e) {
-      console.error("Failed to send activation message:", e.message);
-    }
+    } catch (e) { console.error("Activation msg failed:", e.message); }
   } else {
     updateGroup(chatId, "active", false);
   }
@@ -654,147 +517,113 @@ bot.on("my_chat_member", async (ctx) => {
 
 bot.on(":new_chat_members", async (ctx) => {
   const chatId = ctx.chat.id;
-  const group = getGroup(chatId);
+  const g = getGroup(chatId);
+  if (!g.welcome_enabled) return;
 
-  if (!group.welcome_enabled) return;
+  if (!botId) botId = (await bot.api.getMe()).id;
+  const groupName = esc(ctx.chat.title || "this group");
+  const tpl = g.welcome_text || "default";
 
-  const groupName = escapeMD(ctx.chat.title || "this group");
-  const template = group.welcome_text || "default";
-  const botInfo = await bot.api.getMe();
-
-  for (const member of ctx.msg.new_chat_members) {
-    if (member.id === botInfo.id) continue;
-
-    const userName = member.username
-      ? `@${member.username}`
-      : escapeMD(member.first_name);
-
-    const welcome = getWelcomeText(template, userName, groupName);
+  for (const m of ctx.msg.new_chat_members) {
+    if (m.id === botId) continue;
+    const name = m.username ? `@${m.username}` : esc(m.first_name);
     try {
-      await bot.api.sendMessage(chatId, welcome, { parse_mode: "MarkdownV2" });
+      await bot.api.sendMessage(chatId, welcomeText(name, groupName, tpl), { parse_mode: "MarkdownV2" });
       bumpStat(chatId, "welcomes");
-    } catch (e) {
-      console.error("Welcome send failed:", e.message);
-    }
+    } catch (e) { console.error("Welcome failed:", e.message); }
   }
 });
 
-// ─── Main Message Protection ──────────────────────────────────────────────────
+// ─── Message Protection Engine (FAST) ─────────────────────────────────────────
 
 bot.on("message", async (ctx, next) => {
-  // Skip private chats
   if (!ctx.chat || ctx.chat.type === "private") return next();
-  // Skip commands (handled separately)
   if (ctx.msg.text && ctx.msg.text.startsWith("/")) return next();
 
   const chatId = ctx.chat.id;
   const userId = ctx.from.id;
-  const group = getGroup(chatId);
+  const g = getGroup(chatId);
 
-  // Skip if bot is not admin
-  if (!group.active) return next();
-
-  // Skip admins — they are exempt
+  if (!g.active) return next();
   if (await isAdmin(chatId, userId)) return next();
 
   const text = ctx.msg.text || ctx.msg.caption || "";
   let deleted = false;
   let reason = "";
 
-  // ── Anti-Link ─────────────────────────────────────────────────────
-  if (group.anti_link && !deleted && containsLink(text)) {
-    reason = "🔗 Sending links is not allowed";
+  // Check all violations (fast — stop at first)
+  if (g.anti_link && hasLink(text)) { reason = "🔗 Links not allowed"; }
+  else if (g.anti_mention && hasMention(text)) { reason = "🚫 @Mentions not allowed"; }
+  else if (g.anti_photo && ctx.msg.photo) { reason = "📸 Photos not allowed"; }
+  else if (g.anti_forward && ctx.msg.forward_date) { reason = "↔️ Forwards not allowed"; }
+  else if (g.anti_sticker && (ctx.msg.sticker || ctx.msg.animation)) { reason = "🎭 Stickers/GIFs not allowed"; }
+  else if (g.anti_flood && checkFlood(chatId, userId)) { reason = "🌊 Flooding detected"; }
+
+  if (reason) {
     try {
       await ctx.deleteMessage();
       deleted = true;
       bumpStat(chatId, "deletes");
-    } catch (e) {
-      console.error("Delete failed:", e.message);
-    }
+    } catch (e) { /* already deleted or no permission */ }
   }
 
-  // ── Anti-@Mention ─────────────────────────────────────────────────
-  if (group.anti_mention && !deleted && containsMention(text)) {
-    reason = "🚫 @mentioning users is not allowed";
-    try {
-      await ctx.deleteMessage();
-      deleted = true;
-      bumpStat(chatId, "deletes");
-    } catch (e) {
-      console.error("Delete failed:", e.message);
-    }
-  }
-
-  // ── Anti-Photo ────────────────────────────────────────────────────
-  if (group.anti_photo && !deleted && ctx.msg.photo) {
-    reason = "📸 Sending photos is not allowed";
-    try {
-      await ctx.deleteMessage();
-      deleted = true;
-      bumpStat(chatId, "deletes");
-    } catch (e) {
-      console.error("Delete failed:", e.message);
-    }
-  }
-
-  // ── Anti-Forward ──────────────────────────────────────────────────
-  if (group.anti_forward && !deleted && ctx.msg.forward_date) {
-    reason = "↔️ Forwarded messages are not allowed";
-    try {
-      await ctx.deleteMessage();
-      deleted = true;
-      bumpStat(chatId, "deletes");
-    } catch (e) {
-      console.error("Delete failed:", e.message);
-    }
-  }
-
-  // ── Anti-Sticker/Animation ────────────────────────────────────────
-  if (group.anti_sticker && !deleted && (ctx.msg.sticker || ctx.msg.animation)) {
-    reason = "🎭 Stickers/GIFs are not allowed";
-    try {
-      await ctx.deleteMessage();
-      deleted = true;
-      bumpStat(chatId, "deletes");
-    } catch (e) {
-      console.error("Delete failed:", e.message);
-    }
-  }
-
-  // ── Anti-Flood ────────────────────────────────────────────────────
-  if (group.anti_flood && !deleted && checkFlood(chatId, userId)) {
-    reason = "🌊 Flooding — sending too many messages";
-    try {
-      await ctx.deleteMessage();
-      deleted = true;
-      bumpStat(chatId, "deletes");
-    } catch (e) {
-      console.error("Delete failed:", e.message);
-    }
-  }
-
-  // ── Warn the user if a message was deleted ────────────────────────
-  if (deleted && reason) {
-    await warnUser(chatId, ctx.from, reason);
-  }
+  if (deleted) await warnUser(chatId, ctx.from, reason);
 });
 
-// ─── Start Bot ────────────────────────────────────────────────────────────────
+// ─── Error Handler ────────────────────────────────────────────────────────────
+
+bot.catch((err) => {
+  const e = err.error || err;
+  console.error("Bot error:", e.message || e);
+});
+
+// ─── HTTP Health Server (Required for Render) ─────────────────────────────────
+
+function startHealthServer() {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      status: "ok",
+      bot: "ShieldGuard v2.0",
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString(),
+    }));
+  });
+
+  server.listen(PORT, () => {
+    console.log(`🏥 Health server listening on port ${PORT}`);
+  });
+}
+
+// ─── Start Everything ─────────────────────────────────────────────────────────
 
 async function main() {
-  console.log("🛡️ ShieldGuard Bot starting...");
+  console.log("🛡️ ShieldGuard v2.0 starting...");
 
-  // Delete webhook if any (needed for polling)
-  await bot.api.deleteWebhook({ drop_pending_updates: true });
+  // Start health server FIRST (Render needs port binding within 60s)
+  startHealthServer();
 
-  console.log("🛡️ ShieldGuard Bot is running!");
+  try {
+    await bot.api.deleteWebhook({ drop_pending_updates: true });
+    console.log("✅ Webhook cleared");
+  } catch (e) {
+    if (e.error_code === 401) {
+      console.error("❌ BOT_TOKEN is invalid! Get the correct token from @BotFather");
+      console.error("   Set it as environment variable BOT_TOKEN on Render");
+      console.error("   Bot will NOT start until the token is fixed.");
+      console.error("   Health server is still running so Render won't crash.");
+      return;
+    }
+    console.error("Webhook delete warning:", e.message);
+  }
+
+  console.log("🛡️ ShieldGuard Bot is LIVE!");
   bot.start({
-    onStart: () => console.log("🛡️ Bot started with long polling!"),
+    onStart: (info) => console.log(`🤖 Connected as @${info.username}`),
     drop_pending_updates: true,
   });
 }
 
 main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
+  console.error("Fatal:", err.message || err);
 });
